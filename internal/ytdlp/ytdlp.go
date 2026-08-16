@@ -27,7 +27,7 @@ type VideoOptions struct {
 	SubLang   string // defaults to "en"
 }
 
-var videoIDPattern = regexp.MustCompile(`(?:v=|youtu\.be/)([\w-]{11})`)
+var videoIDPattern = regexp.MustCompile(`(?:[?&]v=|youtu\.be/|youtube\.com/shorts/)([\w-]{11})`)
 
 func videoID(url string) string {
 	m := videoIDPattern.FindStringSubmatch(url)
@@ -37,9 +37,26 @@ func videoID(url string) string {
 	return m[1]
 }
 
-func sanitizeFilename(name string) string {
-	re := regexp.MustCompile(`[<>:"/\\|?*\s\x{00a0}]+`)
-	return strings.TrimSpace(re.ReplaceAllString(name, " "))
+func validateQuality(q string) error {
+	if q == "best" {
+		return nil
+	}
+	switch q {
+	case "480", "720", "1080":
+		return nil
+	default:
+		return fmt.Errorf("invalid quality %q: use 480, 720, 1080, or best", q)
+	}
+}
+
+func outputBase(meta map[string]any, fallbackID string) string {
+	if id, ok := meta["id"].(string); ok && id != "" {
+		return id
+	}
+	if fallbackID != "" {
+		return fallbackID
+	}
+	return "video"
 }
 
 // Audio runs `yt-dlp -x --audio-format mp3 --audio-quality 0 <url>`,
@@ -70,6 +87,12 @@ func Video(ctx context.Context, c *docker.Client, image, hostMount, url string, 
 	if opts.Quality == "" {
 		opts.Quality = "720"
 	}
+	if err := validateQuality(opts.Quality); err != nil {
+		return err
+	}
+	if strings.TrimSpace(url) == "" {
+		return fmt.Errorf("URL cannot be empty")
+	}
 
 	id := videoID(url)
 	cachedPath, meta := findCachedInfoJSON(hostMount, id)
@@ -86,6 +109,35 @@ func Video(ctx context.Context, c *docker.Client, image, hostMount, url string, 
 // findCachedInfoJSON scans hostMount for a *.info.json whose "id" field
 // matches videoID. Reading happens directly on the host filesystem —
 // the mounted folder is just a normal directory to the Go process.
+func findLatestInfoJSON(hostMount string) (string, map[string]any) {
+	matches, _ := filepath.Glob(filepath.Join(hostMount, "*.info.json"))
+	var latestPath string
+	var latestTime int64
+	for _, p := range matches {
+		info, err := os.Stat(p)
+		if err != nil || !info.Mode().IsRegular() {
+			continue
+		}
+		mtime := info.ModTime().UnixNano()
+		if latestPath == "" || mtime > latestTime {
+			latestPath = p
+			latestTime = mtime
+		}
+	}
+	if latestPath == "" {
+		return "", nil
+	}
+	data, err := os.ReadFile(latestPath)
+	if err != nil {
+		return "", nil
+	}
+	var meta map[string]any
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return "", nil
+	}
+	return latestPath, meta
+}
+
 func findCachedInfoJSON(hostMount, id string) (string, map[string]any) {
 	if id == "" {
 		return "", nil
@@ -119,7 +171,7 @@ func formatString(quality string) string {
 func videoFresh(ctx context.Context, c *docker.Client, image, hostMount, url string, opts VideoOptions) error {
 	cmd := []string{
 		"yt-dlp",
-		"-o", "%(title)s.%(ext)s",
+		"-o", "%(id)s.%(ext)s",
 		"-f", formatString(opts.Quality),
 		"--merge-output-format", "mkv",
 		"--write-info-json",
@@ -142,6 +194,9 @@ func videoFresh(ctx context.Context, c *docker.Client, image, hostMount, url str
 	id := videoID(url)
 	_, meta := findCachedInfoJSON(hostMount, id)
 	if meta == nil {
+		_, meta = findLatestInfoJSON(hostMount)
+	}
+	if meta == nil {
 		return fmt.Errorf("download finished but couldn't locate the resulting info.json")
 	}
 	return muxIfNeeded(ctx, c, image, hostMount, meta, opts)
@@ -153,7 +208,7 @@ func videoFresh(ctx context.Context, c *docker.Client, image, hostMount, url str
 func videoFromCache(ctx context.Context, c *docker.Client, image, hostMount, url string, meta map[string]any, opts VideoOptions) error {
 	cmd := []string{
 		"yt-dlp",
-		"-o", "%(title)s.%(ext)s",
+		"-o", "%(id)s.%(ext)s",
 		"-f", formatString(opts.Quality),
 		"--merge-output-format", "mkv",
 		"--continue",
@@ -178,11 +233,7 @@ func videoFromCache(ctx context.Context, c *docker.Client, image, hostMount, url
 // needed) and, if chapters or subtitles are wanted, calls mux.Combine
 // to run ffmpeg inside the toolbox container.
 func muxIfNeeded(ctx context.Context, c *docker.Client, image, hostMount string, meta map[string]any, opts VideoOptions) error {
-	title, _ := meta["title"].(string)
-	base := sanitizeFilename(title)
-	if base == "" {
-		base = "video"
-	}
+	base := outputBase(meta, videoIDFromMeta(meta))
 
 	videoFile := findDownloadedFile(hostMount, base)
 	if videoFile == "" {
@@ -204,6 +255,9 @@ func muxIfNeeded(ctx context.Context, c *docker.Client, image, hostMount string,
 	var subsRel string
 	if opts.Subtitles {
 		subsRel = findSubtitleFile(hostMount, base, opts.SubLang)
+		if subsRel == "" {
+			return fmt.Errorf("subtitles requested but no %s subtitle file was produced", opts.SubLang)
+		}
 	}
 
 	if chaptersRel == "" && subsRel == "" {
@@ -211,12 +265,40 @@ func muxIfNeeded(ctx context.Context, c *docker.Client, image, hostMount string,
 		return nil
 	}
 
-	return mux.Combine(ctx, c, image, hostMount, mux.CombineOptions{
+	finalRel := base + " [final].mkv"
+	if err := mux.Combine(ctx, c, image, hostMount, mux.CombineOptions{
 		VideoRel:    filepath.Base(videoFile),
 		SubsRel:     subsRel,
 		ChaptersRel: chaptersRel,
-		FinalRel:    base + " [final].mkv",
-	})
+		FinalRel:    finalRel,
+	}); err != nil {
+		return err
+	}
+
+	finalPath := filepath.Join(hostMount, finalRel)
+	finalTarget := filepath.Join(hostMount, base+".mkv")
+	if filepath.Clean(videoFile) != filepath.Clean(finalTarget) {
+		if err := os.Remove(videoFile); err != nil {
+			return fmt.Errorf("removing pre-mux video %s: %w", filepath.Base(videoFile), err)
+		}
+	}
+	if err := os.Rename(finalPath, finalTarget); err != nil {
+		return fmt.Errorf("finalizing muxed video: %w", err)
+	}
+	if chaptersRel != "" {
+		_ = os.Remove(filepath.Join(hostMount, chaptersRel))
+	}
+	if subsRel != "" {
+		_ = os.Remove(filepath.Join(hostMount, subsRel))
+	}
+
+	fmt.Fprintf(os.Stderr, "Done: %s\n", finalTarget)
+	return nil
+}
+
+func videoIDFromMeta(meta map[string]any) string {
+	id, _ := meta["id"].(string)
+	return id
 }
 
 func findDownloadedFile(hostMount, base string) string {

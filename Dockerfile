@@ -1,7 +1,8 @@
-# toolctl toolbox image: everything the CLI shells out to, bundled
-# together since these tools are always invoked in sequence against
-# the same mounted folder, never as separate long-running services.
-FROM python:3.12-slim
+FROM denoland/deno:bin-2.9.4 AS deno
+
+FROM python:3.12.13-slim-bookworm
+
+COPY --from=deno /deno /usr/local/bin/deno
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg \
@@ -10,7 +11,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir yt-dlp gallery-dl
+RUN python -m pip install --no-cache-dir \
+        "yt-dlp[default]==2026.7.4" \
+        "gallery-dl==1.32.8"
 
 WORKDIR /data
 

@@ -1,20 +1,24 @@
 // Package docker wraps the subset of the Docker Engine API client that
-// toolctl needs: resolving a client the same way the docker CLI does
-// (respecting DOCKER_HOST / contexts / Docker Desktop's socket), ensuring
+// toolctl needs: resolving the Engine client, ensuring
 // the toolbox image is present, and running one-shot ephemeral containers
 // with a single bind mount.
 //
 // Built against github.com/moby/moby/client — the maintained successor to
-// the now-deprecated github.com/docker/docker/client. See go.mod for why.
+// the deprecated github.com/docker/docker/client. See go.mod for why.
 package docker
 
 import (
-	"bufio"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"runtime"
 
+	"github.com/containerd/errdefs"
+	"github.com/moby/moby/api/pkg/stdcopy"
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/mount"
 	"github.com/moby/moby/client"
@@ -29,14 +33,24 @@ type Client struct {
 	cli *client.Client
 }
 
-// NewClient resolves a Docker client from the environment exactly like
-// the docker CLI does: DOCKER_HOST, docker contexts, and Docker
-// Desktop's named-pipe/socket are all honored via FromEnv, and API
-// version negotiation happens automatically on the first request. This
-// means toolctl works identically whether the user has only the Engine
-// + daemon running or the full Docker Desktop app — no dependency on
-// the `docker` binary being on PATH at all.
+// NewClient resolves a Docker Engine client from supported environment
+// settings. API version negotiation happens automatically on the first
+// request. The Docker CLI is not required at runtime.
 func NewClient() (*Client, error) {
+	// Docker Desktop for Linux uses a per-user socket instead of the
+	// Engine default /var/run/docker.sock. The Docker CLI manages its
+	// context separately, but the Go SDK intentionally reads environment
+	// configuration only. Detect the standard Desktop socket when the
+	// caller has not explicitly set DOCKER_HOST.
+	if os.Getenv("DOCKER_HOST") == "" && runtime.GOOS == "linux" {
+		if home, err := os.UserHomeDir(); err == nil {
+			desktopSocket := filepath.Join(home, ".docker", "desktop", "docker.sock")
+			if _, err := os.Stat(desktopSocket); err == nil {
+				_ = os.Setenv("DOCKER_HOST", "unix://"+desktopSocket)
+			}
+		}
+	}
+
 	cli, err := client.New(
 		client.FromEnv,
 		client.WithUserAgent("toolctl/1.0.0"),
@@ -58,6 +72,8 @@ func (c *Client) Close() error {
 func (c *Client) EnsureImage(ctx context.Context, imageRef string) error {
 	if _, err := c.cli.ImageInspect(ctx, imageRef); err == nil {
 		return nil // already present
+	} else if !errdefs.IsNotFound(err) {
+		return fmt.Errorf("inspecting image %s: %w", imageRef, err)
 	}
 
 	fmt.Fprintf(os.Stderr, "Image %s not found locally, pulling...\n", imageRef)
@@ -69,12 +85,39 @@ func (c *Client) EnsureImage(ctx context.Context, imageRef string) error {
 
 	// Drain the pull's JSON progress stream to stderr rather than
 	// parsing it — good enough for a CLI tool's terminal output.
-	scanner := bufio.NewScanner(pull)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for scanner.Scan() {
-		fmt.Fprintln(os.Stderr, scanner.Text())
+	type pullMessage struct {
+		Status      string `json:"status"`
+		Progress    string `json:"progress"`
+		Error       string `json:"error"`
+		ErrorDetail struct {
+			Message string `json:"message"`
+		} `json:"errorDetail"`
 	}
-	return scanner.Err()
+
+	decoder := json.NewDecoder(pull)
+	for {
+		var msg pullMessage
+		if err := decoder.Decode(&msg); err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return fmt.Errorf("reading image pull response: %w", err)
+		}
+		if msg.Error != "" {
+			if msg.ErrorDetail.Message != "" {
+				return fmt.Errorf("pulling image %s: %s", imageRef, msg.ErrorDetail.Message)
+			}
+			return fmt.Errorf("pulling image %s: %s", imageRef, msg.Error)
+		}
+		if msg.Status != "" {
+			if msg.Progress != "" {
+				fmt.Fprintf(os.Stderr, "%s %s\n", msg.Status, msg.Progress)
+			} else {
+				fmt.Fprintln(os.Stderr, msg.Status)
+			}
+		}
+	}
+	return nil
 }
 
 // RunOptions configures a single ephemeral container invocation.
@@ -94,16 +137,17 @@ type RunOptions struct {
 // Run creates a container, streams its combined stdout/stderr to the
 // current process's stdout/stderr, waits for it to exit, and removes
 // it. It returns an error if the container exits non-zero.
-//
-// NOTE: ContainerCreateOptions and ContainerWaitOptions/Result are new
-// (post-v29) option-struct types on a young, independently-versioned
-// module. The field names below are believed correct as of this
-// writing but haven't been compiled against a live copy of the module
-// in this environment — if `go build` reports a field mismatch here,
-// run `go doc github.com/moby/moby/client ContainerCreateOptions` (and
-// ContainerWaitOptions/ContainerWaitResult) to confirm the exact shape
-// and adjust.
 func (c *Client) Run(ctx context.Context, opts RunOptions) error {
+	if len(opts.Cmd) == 0 {
+		return errors.New("container command cannot be empty")
+	}
+	if opts.Image == "" {
+		return errors.New("container image cannot be empty")
+	}
+	if opts.HostMountPath == "" {
+		return errors.New("host mount path cannot be empty")
+	}
+
 	workDir := opts.WorkDir
 	if workDir == "" {
 		workDir = ContainerDataDir
@@ -117,21 +161,25 @@ func (c *Client) Run(ctx context.Context, opts RunOptions) error {
 			Tty:        false,
 		},
 		HostConfig: &container.HostConfig{
-			Mounts: []mount.Mount{
-				{
-					Type:   mount.TypeBind,
-					Source: opts.HostMountPath,
-					Target: ContainerDataDir,
-				},
-			},
+			Mounts: []mount.Mount{{
+				Type:     mount.TypeBind,
+				Source:   opts.HostMountPath,
+				Target:   ContainerDataDir,
+				ReadOnly: false,
+			}},
 		},
 	})
 	if err != nil {
 		return fmt.Errorf("creating container: %w", err)
 	}
-	defer func() {
-		_, _ = c.cli.ContainerRemove(context.Background(), created.ID, client.ContainerRemoveOptions{Force: true})
-	}()
+
+	remove := func() {
+		cleanupCtx := context.Background()
+		if _, err := c.cli.ContainerRemove(cleanupCtx, created.ID, client.ContainerRemoveOptions{Force: true}); err != nil && !errdefs.IsNotFound(err) {
+			fmt.Fprintf(os.Stderr, "warning: removing container %s: %v\n", created.ID[:12], err)
+		}
+	}
+	defer remove()
 
 	if _, err := c.cli.ContainerStart(ctx, created.ID, client.ContainerStartOptions{}); err != nil {
 		return fmt.Errorf("starting container: %w", err)
@@ -146,42 +194,25 @@ func (c *Client) Run(ctx context.Context, opts RunOptions) error {
 		return fmt.Errorf("attaching to container logs: %w", err)
 	}
 	defer logs.Close()
-	// Docker multiplexes stdout/stderr with an 8-byte header per frame
-	// when Tty is false; demux splits them back out.
-	go demux(logs, os.Stdout, os.Stderr)
+
+	if _, err := stdcopy.StdCopy(os.Stdout, os.Stderr, logs); err != nil && !errors.Is(err, io.EOF) {
+		return fmt.Errorf("reading container logs: %w", err)
+	}
 
 	wait := c.cli.ContainerWait(ctx, created.ID, client.ContainerWaitOptions{
 		Condition: container.WaitConditionNotRunning,
 	})
 	select {
-	case err := <-wait.ErrCh:
+	case err := <-wait.Error:
 		if err != nil {
 			return fmt.Errorf("waiting for container: %w", err)
 		}
-	case status := <-wait.StatusCh:
-		if status.StatusCode != 0 {
-			return fmt.Errorf("command exited with status %d", status.StatusCode)
+	case result := <-wait.Result:
+		if result.StatusCode != 0 {
+			return fmt.Errorf("command exited with status %d", result.StatusCode)
 		}
+	case <-ctx.Done():
+		return fmt.Errorf("container command canceled: %w", ctx.Err())
 	}
 	return nil
-}
-
-// demux copies Docker's multiplexed log stream to separate stdout/stderr
-// writers. Kept local and minimal rather than pulling in a stdcopy
-// package dependency for one call site.
-func demux(src io.Reader, stdout, stderr io.Writer) {
-	header := make([]byte, 8)
-	for {
-		if _, err := io.ReadFull(src, header); err != nil {
-			return
-		}
-		size := int(header[4])<<24 | int(header[5])<<16 | int(header[6])<<8 | int(header[7])
-		dst := stdout
-		if header[0] == 2 {
-			dst = stderr
-		}
-		if _, err := io.CopyN(dst, src, int64(size)); err != nil {
-			return
-		}
-	}
 }

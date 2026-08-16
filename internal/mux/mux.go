@@ -35,11 +35,22 @@ func WriteChaptersFile(path string, chapters []any, duration float64) error {
 		if title == "" {
 			title = fmt.Sprintf("Chapter %d", i+1)
 		}
+		title = escapeFFMetadata(title)
 		fmt.Fprintf(&b, "[CHAPTER]\nTIMEBASE=1/1000\nSTART=%d\nEND=%d\ntitle=%s\n",
 			int64(start*1000), int64(end*1000), title)
 	}
 
 	return os.WriteFile(path, []byte(b.String()), 0o644)
+}
+
+func escapeFFMetadata(s string) string {
+	s = strings.ReplaceAll(s, "\\", "\\\\")
+	s = strings.ReplaceAll(s, "=", "\\=")
+	s = strings.ReplaceAll(s, ";", "\\;")
+	s = strings.ReplaceAll(s, "#", "\\#")
+	s = strings.ReplaceAll(s, "\r", " ")
+	s = strings.ReplaceAll(s, "\n", "\\\n")
+	return s
 }
 
 // CombineOptions describes a single mux call. All paths are relative
@@ -56,26 +67,39 @@ type CombineOptions struct {
 // mux video + optional subtitle track + optional chapter markers into
 // FinalRel, using stream copy (no re-encoding).
 func Combine(ctx context.Context, c *docker.Client, image, hostMount string, opts CombineOptions) error {
-	cmd := []string{"ffmpeg", "-y", "-i", opts.VideoRel}
+	if opts.VideoRel == "" || opts.FinalRel == "" {
+		return fmt.Errorf("video and final output paths are required")
+	}
 
+	cmd := []string{"ffmpeg", "-hide_banner", "-y", "-i", opts.VideoRel}
 	inputIdx := 1
 	subInputIdx := -1
+	chaptersInputIdx := -1
+
 	if opts.SubsRel != "" {
 		cmd = append(cmd, "-i", opts.SubsRel)
 		subInputIdx = inputIdx
 		inputIdx++
 	}
 	if opts.ChaptersRel != "" {
-		cmd = append(cmd, "-i", opts.ChaptersRel)
-		cmd = append(cmd, "-map_metadata", fmt.Sprintf("%d", inputIdx))
-		inputIdx++
+		cmd = append(cmd, "-f", "ffmetadata", "-i", opts.ChaptersRel)
+		chaptersInputIdx = inputIdx
 	}
 
-	cmd = append(cmd, "-map", "0:v", "-map", "0:a")
+	cmd = append(cmd, "-map", "0:v:0")
+	cmd = append(cmd, "-map", "0:a:0?")
 	if subInputIdx >= 0 {
-		cmd = append(cmd, "-map", fmt.Sprintf("%d:s", subInputIdx), "-c:s", "srt")
+		cmd = append(cmd, "-map", fmt.Sprintf("%d:s:0", subInputIdx))
 	}
-	cmd = append(cmd, "-c:v", "copy", "-c:a", "copy", opts.FinalRel)
+	if chaptersInputIdx >= 0 {
+		cmd = append(cmd, "-map_metadata", fmt.Sprintf("%d", chaptersInputIdx))
+	}
+
+	cmd = append(cmd, "-c:v", "copy", "-c:a", "copy")
+	if subInputIdx >= 0 {
+		cmd = append(cmd, "-c:s", "subrip")
+	}
+	cmd = append(cmd, opts.FinalRel)
 
 	fmt.Fprintf(os.Stderr, "Muxing final file -> %s\n", opts.FinalRel)
 	if err := c.Run(ctx, docker.RunOptions{Image: image, HostMountPath: hostMount, Cmd: cmd}); err != nil {

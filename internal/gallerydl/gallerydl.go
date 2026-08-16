@@ -3,18 +3,23 @@ package gallerydl
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 
 	"github.com/nithinK-142/toolctl/internal/docker"
 )
 
-// Download runs `gallery-dl <url>` with output rooted at the mounted
-// data folder. gallery-dl's own config file (cookies, extractor
-// options, etc.) is expected at <mount>/gallery-dl.conf, which the
-// tool picks up automatically when run with --data-directory /data.
+// Download runs gallery-dl against a URL. A config file at
+// <mount>/gallery-dl.conf is loaded explicitly when present.
 func Download(ctx context.Context, c *docker.Client, image, hostMount, url string) error {
+	cmd := []string{"gallery-dl", "--destination", "/data", url}
+	configPath := filepath.Join(hostMount, "gallery-dl.conf")
+	if _, err := os.Stat(configPath); err == nil {
+		cmd = []string{"gallery-dl", "--config", "/data/gallery-dl.conf", "--destination", "/data", url}
+	}
 	return c.Run(ctx, docker.RunOptions{
 		Image:         image,
 		HostMountPath: hostMount,
-		Cmd:           []string{"gallery-dl", "-d", ".", url},
+		Cmd:           cmd,
 	})
 }

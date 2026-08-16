@@ -1,16 +1,18 @@
 BINARY := bin/toolctl
 IMAGE := toolctl/tools:latest
+PREFIX ?= $(HOME)/.local
 
 .PHONY: build image install clean
 
 build:
-	go build -o $(BINARY) ./cmd/toolctl
+	go build -trimpath -ldflags="-s -w" -o $(BINARY) ./cmd/toolctl
 
 image:
-	docker build -t $(IMAGE) -f docker/Dockerfile .
+	docker build -t $(IMAGE) -f Dockerfile .
 
 install: build
-	cp $(BINARY) /usr/local/bin/toolctl
+	mkdir -p $(PREFIX)/bin
+	cp $(BINARY) $(PREFIX)/bin/toolctl
 
 clean:
 	rm -rf bin
