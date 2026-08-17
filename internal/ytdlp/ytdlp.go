@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/nithinK-142/toolctl/internal/docker"
 	"github.com/nithinK-142/toolctl/internal/mux"
@@ -50,13 +51,56 @@ func validateQuality(q string) error {
 }
 
 func outputBase(meta map[string]any, fallbackID string) string {
-	if id, ok := meta["id"].(string); ok && id != "" {
-		return id
+	title, _ := meta["title"].(string)
+	title = sanitizeFilename(title)
+	if title != "" {
+		return title
 	}
 	if fallbackID != "" {
 		return fallbackID
 	}
 	return "video"
+}
+
+func sanitizeFilename(name string) string {
+	name = strings.TrimSpace(name)
+	name = strings.Map(func(r rune) rune {
+		switch r {
+		case '\x00', '/', '\\', ':', '*', '?', '"', '<', '>', '|':
+			return '-'
+		default:
+			return r
+		}
+	}, name)
+	name = strings.Trim(name, " .")
+	if !utf8.ValidString(name) {
+		name = fallbackASCII(name)
+	}
+	if name == "" {
+		return "video"
+	}
+	const maxNameBytes = 180
+	if len(name) > maxNameBytes {
+		for len(name) > maxNameBytes {
+			_, size := utf8.DecodeLastRuneInString(name)
+			if size == 0 {
+				break
+			}
+			name = name[:len(name)-size]
+		}
+		name = strings.TrimSpace(name)
+	}
+	return name
+}
+
+func fallbackASCII(name string) string {
+	var b strings.Builder
+	for _, r := range name {
+		if r < 128 && r >= 32 {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 // Audio runs `yt-dlp -x --audio-format mp3 --audio-quality 0 <url>`,
@@ -233,7 +277,11 @@ func videoFromCache(ctx context.Context, c *docker.Client, image, hostMount, url
 // needed) and, if chapters or subtitles are wanted, calls mux.Combine
 // to run ffmpeg inside the toolbox container.
 func muxIfNeeded(ctx context.Context, c *docker.Client, image, hostMount string, meta map[string]any, opts VideoOptions) error {
-	base := outputBase(meta, videoIDFromMeta(meta))
+	id := videoIDFromMeta(meta)
+	base := id
+	if base == "" {
+		base = outputBase(meta, "")
+	}
 
 	videoFile := findDownloadedFile(hostMount, base)
 	if videoFile == "" {
@@ -260,23 +308,40 @@ func muxIfNeeded(ctx context.Context, c *docker.Client, image, hostMount string,
 		}
 	}
 
+	title, _ := meta["title"].(string)
+	title = sanitizeFilename(title)
+	if title == "" {
+		title = base
+	}
+
 	if chaptersRel == "" && subsRel == "" {
-		fmt.Fprintln(os.Stderr, "No subs/chapters to embed — video saved as-is.")
+		finalTarget := filepath.Join(hostMount, title+".mkv")
+		if filepath.Clean(videoFile) != filepath.Clean(finalTarget) {
+			if err := os.Rename(videoFile, finalTarget); err != nil {
+				return fmt.Errorf("renaming video to title: %w", err)
+			}
+		}
+		fmt.Fprintf(os.Stderr, "Done: %s\n", finalTarget)
 		return nil
 	}
 
 	finalRel := base + " [final].mkv"
+
 	if err := mux.Combine(ctx, c, image, hostMount, mux.CombineOptions{
-		VideoRel:    filepath.Base(videoFile),
-		SubsRel:     subsRel,
-		ChaptersRel: chaptersRel,
-		FinalRel:    finalRel,
+		VideoRel:      filepath.Base(videoFile),
+		SubsRel:       subsRel,
+		ChaptersRel:   chaptersRel,
+		FinalRel:      finalRel,
+		Title:         title,
+		SubtitleLang:  opts.SubLang,
+		SubtitleTitle: opts.SubLang,
 	}); err != nil {
 		return err
 	}
 
 	finalPath := filepath.Join(hostMount, finalRel)
-	finalTarget := filepath.Join(hostMount, base+".mkv")
+	finalTarget := filepath.Join(hostMount, title+".mkv")
+
 	if filepath.Clean(videoFile) != filepath.Clean(finalTarget) {
 		if err := os.Remove(videoFile); err != nil {
 			return fmt.Errorf("removing pre-mux video %s: %w", filepath.Base(videoFile), err)

@@ -57,10 +57,13 @@ func escapeFFMetadata(s string) string {
 // to the mounted data folder (i.e. as they'd appear under /data in
 // the container).
 type CombineOptions struct {
-	VideoRel    string // required
-	SubsRel     string // optional
-	ChaptersRel string // optional
-	FinalRel    string // output filename
+	VideoRel      string // required
+	SubsRel       string // optional
+	ChaptersRel   string // optional
+	FinalRel      string // output filename
+	Title         string // output container title
+	SubtitleLang  string // subtitle language metadata
+	SubtitleTitle string // subtitle track title
 }
 
 // Combine runs one ffmpeg invocation inside the toolbox container to
@@ -92,12 +95,22 @@ func Combine(ctx context.Context, c *docker.Client, image, hostMount string, opt
 		cmd = append(cmd, "-map", fmt.Sprintf("%d:s:0", subInputIdx))
 	}
 	if chaptersInputIdx >= 0 {
-		cmd = append(cmd, "-map_metadata", fmt.Sprintf("%d", chaptersInputIdx))
+		cmd = append(cmd, "-map_chapters", fmt.Sprintf("%d", chaptersInputIdx))
 	}
 
 	cmd = append(cmd, "-c:v", "copy", "-c:a", "copy")
+	if opts.Title != "" {
+		cmd = append(cmd, "-metadata", "title="+opts.Title)
+	}
 	if subInputIdx >= 0 {
 		cmd = append(cmd, "-c:s", "subrip")
+		if opts.SubtitleLang != "" {
+			cmd = append(cmd, "-metadata:s:s:0", "language="+opts.SubtitleLang)
+		}
+		if opts.SubtitleTitle != "" {
+			cmd = append(cmd, "-metadata:s:s:0", "title="+opts.SubtitleTitle)
+		}
+		cmd = append(cmd, "-disposition:s:0", "default")
 	}
 	cmd = append(cmd, opts.FinalRel)
 
