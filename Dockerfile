@@ -12,9 +12,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 RUN python -m pip install --no-cache-dir \
-        "yt-dlp[default]==2026.7.4" \
-        "gallery-dl==1.32.8" \
-        "bgutil-ytdlp-pot-provider==1.3.1"
+    "yt-dlp[default,curl-cffi]==2026.7.4" \
+    "gallery-dl==1.32.8" \
+    "bgutil-ytdlp-pot-provider==1.3.1"
 
 WORKDIR /data
 
