@@ -13,20 +13,28 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
+	"time"
 
 	"github.com/containerd/errdefs"
 	"github.com/moby/moby/api/pkg/stdcopy"
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/mount"
+	"github.com/moby/moby/api/types/network"
 	"github.com/moby/moby/client"
 )
 
 // ContainerDataDir is the fixed path inside every tool container that
 // the host mount path is bound to.
-const ContainerDataDir = "/data"
+const (
+	ContainerDataDir = "/data"
+	ToolNetworkName  = "toolctl-net"
+	POTProviderName  = "toolctl-bgutil"
+	POTProviderPort  = 4416
+)
 
 // Client wraps a resolved Docker Engine API client.
 type Client struct {
@@ -120,6 +128,184 @@ func (c *Client) EnsureImage(ctx context.Context, imageRef string) error {
 	return nil
 }
 
+// EnsurePOTProvider pulls and starts the managed bgutil PO-token provider.
+// The provider is kept on a private Docker network and is not published to
+// the host. The yt-dlp container resolves the provider endpoint dynamically
+// from Docker network state and joins the same private network.
+func (c *Client) EnsurePOTProvider(ctx context.Context, imageRef string) error {
+	if imageRef == "" {
+		return errors.New("PO-token provider image cannot be empty")
+	}
+	if err := c.EnsureImage(ctx, imageRef); err != nil {
+		return err
+	}
+
+	networkID, err := c.ensureNetwork(ctx)
+	if err != nil {
+		return err
+	}
+
+	inspectResult, err := c.cli.ContainerInspect(ctx, POTProviderName, client.ContainerInspectOptions{})
+	var inspect container.InspectResponse
+	if err == nil {
+		inspect = inspectResult.Container
+	}
+	if err == nil {
+		if inspect.Config == nil || inspect.Config.Image != imageRef {
+			if inspect.State != nil && inspect.State.Running {
+				if _, err := c.cli.ContainerStop(ctx, inspect.ID, client.ContainerStopOptions{}); err != nil {
+					return fmt.Errorf("stopping stale PO-token provider: %w", err)
+				}
+			}
+			if _, err := c.cli.ContainerRemove(ctx, inspect.ID, client.ContainerRemoveOptions{Force: true}); err != nil && !errdefs.IsNotFound(err) {
+				return fmt.Errorf("removing stale PO-token provider: %w", err)
+			}
+			err = errdefs.ErrNotFound
+		} else if inspect.State != nil && inspect.State.Running {
+			if err := c.ensureContainerNetwork(ctx, inspect.ID, networkID); err != nil {
+				return err
+			}
+			if inspect.State.Health == nil {
+				return nil
+			}
+			return c.waitForPOTProvider(ctx, inspect.ID)
+		} else {
+			if _, err := c.cli.ContainerStart(ctx, inspect.ID, client.ContainerStartOptions{}); err != nil {
+				return fmt.Errorf("starting PO-token provider: %w", err)
+			}
+			if err := c.ensureContainerNetwork(ctx, inspect.ID, networkID); err != nil {
+				return err
+			}
+			return c.waitForPOTProvider(ctx, inspect.ID)
+		}
+	}
+	if !errdefs.IsNotFound(err) {
+		return fmt.Errorf("inspecting PO-token provider: %w", err)
+	}
+
+	created, err := c.cli.ContainerCreate(ctx, client.ContainerCreateOptions{
+		Name: POTProviderName,
+		Config: &container.Config{
+			Image: imageRef,
+			Healthcheck: &container.HealthConfig{
+				Test:     []string{"CMD", "deno", "eval", "fetch('http://127.0.0.1:4416/ping').then(r => Deno.exit(r.ok ? 0 : 1)).catch(() => Deno.exit(1))"},
+				Interval: 2 * time.Second,
+				Timeout:  2 * time.Second,
+				Retries:  15,
+			},
+		},
+		HostConfig: &container.HostConfig{
+			RestartPolicy: container.RestartPolicy{Name: "unless-stopped"},
+		},
+		NetworkingConfig: &network.NetworkingConfig{
+			EndpointsConfig: map[string]*network.EndpointSettings{
+				ToolNetworkName: &network.EndpointSettings{NetworkID: networkID},
+			},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("creating PO-token provider: %w", err)
+	}
+	if _, err := c.cli.ContainerStart(ctx, created.ID, client.ContainerStartOptions{}); err != nil {
+		return fmt.Errorf("starting PO-token provider: %w", err)
+	}
+	return c.waitForPOTProvider(ctx, created.ID)
+}
+
+func (c *Client) POTProviderURL(ctx context.Context) (string, error) {
+	inspectResult, err := c.cli.ContainerInspect(ctx, POTProviderName, client.ContainerInspectOptions{})
+	if err != nil {
+		return "", fmt.Errorf("inspecting PO-token provider endpoint: %w", err)
+	}
+	inspect := inspectResult.Container
+	if inspect.NetworkSettings == nil || inspect.NetworkSettings.Networks == nil {
+		return "", errors.New("PO-token provider has no Docker network settings")
+	}
+	endpoint, ok := inspect.NetworkSettings.Networks[ToolNetworkName]
+	if !ok || endpoint == nil {
+		return "", fmt.Errorf("PO-token provider is not connected to Docker network %s", ToolNetworkName)
+	}
+	if !endpoint.IPAddress.IsValid() || !endpoint.IPAddress.Is4() {
+		return "", fmt.Errorf("PO-token provider has no IPv4 address on Docker network %s", ToolNetworkName)
+	}
+
+	return "http://" + net.JoinHostPort(endpoint.IPAddress.String(), fmt.Sprintf("%d", POTProviderPort)), nil
+}
+
+func (c *Client) ensureNetwork(ctx context.Context) (string, error) {
+	nets, err := c.cli.NetworkList(ctx, client.NetworkListOptions{})
+	if err != nil {
+		return "", fmt.Errorf("listing Docker networks: %w", err)
+	}
+
+	for _, n := range nets.Items {
+		if n.Name == ToolNetworkName {
+			return n.ID, nil
+		}
+	}
+	created, err := c.cli.NetworkCreate(ctx, ToolNetworkName, client.NetworkCreateOptions{
+		Driver: "bridge",
+	})
+	if err != nil {
+		return "", fmt.Errorf("creating Docker network %s: %w", ToolNetworkName, err)
+	}
+	return created.ID, nil
+}
+
+func (c *Client) ensureContainerNetwork(ctx context.Context, containerID, networkID string) error {
+	if networkID == "" {
+		return errors.New("Docker network ID is empty")
+	}
+	inspectResult, err := c.cli.ContainerInspect(ctx, containerID, client.ContainerInspectOptions{})
+	if err != nil {
+		return fmt.Errorf("inspecting PO-token provider networking: %w", err)
+	}
+	inspect := inspectResult.Container
+	if inspect.NetworkSettings != nil && inspect.NetworkSettings.Networks != nil {
+		for _, endpoint := range inspect.NetworkSettings.Networks {
+			if endpoint != nil && endpoint.NetworkID == networkID {
+				return nil
+			}
+		}
+	}
+	if _, err := c.cli.NetworkConnect(ctx, networkID, client.NetworkConnectOptions{
+		Container:      containerID,
+		EndpointConfig: &network.EndpointSettings{},
+	}); err != nil {
+		return fmt.Errorf("connecting PO-token provider to %s: %w", ToolNetworkName, err)
+	}
+	return nil
+}
+
+func (c *Client) waitForPOTProvider(ctx context.Context, containerID string) error {
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	deadline := time.NewTimer(20 * time.Second)
+	defer deadline.Stop()
+	for {
+		inspectResult, err := c.cli.ContainerInspect(ctx, containerID, client.ContainerInspectOptions{})
+		if err != nil {
+			return fmt.Errorf("inspecting PO-token provider readiness: %w", err)
+		}
+		inspect := inspectResult.Container
+		if inspect.State != nil {
+			if !inspect.State.Running {
+				return fmt.Errorf("PO-token provider exited before becoming ready (exit code %d)", inspect.State.ExitCode)
+			}
+			if inspect.State.Health != nil && inspect.State.Health.Status == "healthy" {
+				return nil
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("waiting for PO-token provider: %w", ctx.Err())
+		case <-deadline.C:
+			return errors.New("timed out waiting for PO-token provider to become healthy")
+		case <-ticker.C:
+		}
+	}
+}
+
 // RunOptions configures a single ephemeral container invocation.
 type RunOptions struct {
 	// Image is the toolbox image to run.
@@ -132,6 +318,8 @@ type RunOptions struct {
 	// WorkDir sets the container's working directory. Defaults to
 	// ContainerDataDir when empty.
 	WorkDir string
+	// Network optionally attaches the container to a named Docker network.
+	Network string
 }
 
 // Run creates a container, streams its combined stdout/stderr to the
@@ -153,7 +341,7 @@ func (c *Client) Run(ctx context.Context, opts RunOptions) error {
 		workDir = ContainerDataDir
 	}
 
-	created, err := c.cli.ContainerCreate(ctx, client.ContainerCreateOptions{
+	createOpts := client.ContainerCreateOptions{
 		Config: &container.Config{
 			Image:      opts.Image,
 			Cmd:        opts.Cmd,
@@ -168,7 +356,15 @@ func (c *Client) Run(ctx context.Context, opts RunOptions) error {
 				ReadOnly: false,
 			}},
 		},
-	})
+	}
+	if opts.Network != "" {
+		createOpts.NetworkingConfig = &network.NetworkingConfig{
+			EndpointsConfig: map[string]*network.EndpointSettings{
+				opts.Network: &network.EndpointSettings{},
+			},
+		}
+	}
+	created, err := c.cli.ContainerCreate(ctx, createOpts)
 	if err != nil {
 		return fmt.Errorf("creating container: %w", err)
 	}

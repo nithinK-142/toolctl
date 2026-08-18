@@ -10,7 +10,10 @@ import (
 	"path/filepath"
 )
 
-const defaultImage = "toolctl/tools:latest"
+const (
+	defaultImage       = "toolctl/tools:latest"
+	defaultPOTProvider = "brainicism/bgutil-ytdlp-pot-provider:1.3.1-deno"
+)
 
 // Config is the on-disk shape of ~/.config/toolctl/config.json.
 type Config struct {
@@ -22,6 +25,10 @@ type Config struct {
 	// Image is the toolbox image tag to run (yt-dlp + gallery-dl +
 	// ffmpeg + jq). Overridable for local builds or pinned versions.
 	Image string `json:"image"`
+
+	// POTProviderImage is the managed Proof-of-Origin token provider image
+	// used by yt-dlp for YouTube GVS requests.
+	POTProviderImage string `json:"pot_provider_image"`
 }
 
 func configPath() (string, error) {
@@ -43,7 +50,7 @@ func Load() (*Config, error) {
 
 	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
-		return &Config{Image: defaultImage}, nil
+		return &Config{Image: defaultImage, POTProviderImage: defaultPOTProvider}, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("reading config at %s: %w", path, err)
@@ -55,6 +62,9 @@ func Load() (*Config, error) {
 	}
 	if cfg.Image == "" {
 		cfg.Image = defaultImage
+	}
+	if cfg.POTProviderImage == "" {
+		cfg.POTProviderImage = defaultPOTProvider
 	}
 	return &cfg, nil
 }

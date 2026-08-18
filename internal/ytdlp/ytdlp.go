@@ -106,15 +106,21 @@ func fallbackASCII(name string) string {
 // Audio runs `yt-dlp -x --audio-format mp3 --audio-quality 0 <url>`,
 // writing output into the mounted data folder.
 func Audio(ctx context.Context, c *docker.Client, image, hostMount, url string) error {
+	providerURL, err := c.POTProviderURL(ctx)
+	if err != nil {
+		return err
+	}
+	cmd := youtubeArgs([]string{
+		"yt-dlp",
+		"-x", "--audio-format", "mp3", "--audio-quality", "0",
+		"-o", "%(title)s.%(ext)s",
+		url,
+	}, providerURL)
 	return c.Run(ctx, docker.RunOptions{
 		Image:         image,
 		HostMountPath: hostMount,
-		Cmd: []string{
-			"yt-dlp",
-			"-x", "--audio-format", "mp3", "--audio-quality", "0",
-			"-o", "%(title)s.%(ext)s",
-			url,
-		},
+		Network:       docker.ToolNetworkName,
+		Cmd:           cmd,
 	})
 }
 
@@ -138,16 +144,21 @@ func Video(ctx context.Context, c *docker.Client, image, hostMount, url string, 
 		return fmt.Errorf("URL cannot be empty")
 	}
 
+	providerURL, err := c.POTProviderURL(ctx)
+	if err != nil {
+		return err
+	}
+
 	id := videoID(url)
 	cachedPath, meta := findCachedInfoJSON(hostMount, id)
 
 	if meta != nil {
 		fmt.Fprintf(os.Stderr, "Found cached metadata (%s) — resuming video only.\n", filepath.Base(cachedPath))
-		return videoFromCache(ctx, c, image, hostMount, url, meta, opts)
+		return videoFromCache(ctx, c, image, hostMount, url, meta, opts, providerURL)
 	}
 
 	fmt.Fprintln(os.Stderr, "No cached metadata — running a fresh download (video + info.json in one call).")
-	return videoFresh(ctx, c, image, hostMount, url, opts)
+	return videoFresh(ctx, c, image, hostMount, url, opts, providerURL)
 }
 
 // findCachedInfoJSON scans hostMount for a *.info.json whose "id" field
@@ -210,9 +221,16 @@ func formatString(quality string) string {
 	return fmt.Sprintf("bestvideo[height<=%s]+bestaudio/best[height<=%s]", quality, quality)
 }
 
+func youtubeArgs(cmd []string, providerURL string) []string {
+	return append(cmd,
+		"--extractor-args", "youtube:player_client=mweb",
+		"--extractor-args", fmt.Sprintf("youtubepot-bgutilhttp:base_url=%s", providerURL),
+	)
+}
+
 // videoFresh performs the original single-call flow: one yt-dlp
 // invocation handles video, info.json, and (optionally) subtitles.
-func videoFresh(ctx context.Context, c *docker.Client, image, hostMount, url string, opts VideoOptions) error {
+func videoFresh(ctx context.Context, c *docker.Client, image, hostMount, url string, opts VideoOptions, providerURL string) error {
 	cmd := []string{
 		"yt-dlp",
 		"-o", "%(id)s.%(ext)s",
@@ -220,7 +238,6 @@ func videoFresh(ctx context.Context, c *docker.Client, image, hostMount, url str
 		"--merge-output-format", "mkv",
 		"--write-info-json",
 		"--continue",
-		"--no-warnings",
 	}
 	if opts.Subtitles {
 		cmd = append(cmd,
@@ -229,9 +246,10 @@ func videoFresh(ctx context.Context, c *docker.Client, image, hostMount, url str
 			"--convert-subs", "srt",
 		)
 	}
+	cmd = youtubeArgs(cmd, providerURL)
 	cmd = append(cmd, url)
 
-	if err := c.Run(ctx, docker.RunOptions{Image: image, HostMountPath: hostMount, Cmd: cmd}); err != nil {
+	if err := c.Run(ctx, docker.RunOptions{Image: image, HostMountPath: hostMount, Network: docker.ToolNetworkName, Cmd: cmd}); err != nil {
 		return err
 	}
 
@@ -249,7 +267,7 @@ func videoFresh(ctx context.Context, c *docker.Client, image, hostMount, url str
 // videoFromCache resumes the video download only (no redundant
 // metadata/subtitle calls) and reuses chapters + subtitle URL already
 // present in the cached info.json.
-func videoFromCache(ctx context.Context, c *docker.Client, image, hostMount, url string, meta map[string]any, opts VideoOptions) error {
+func videoFromCache(ctx context.Context, c *docker.Client, image, hostMount, url string, meta map[string]any, opts VideoOptions, providerURL string) error {
 	cmd := []string{
 		"yt-dlp",
 		"-o", "%(id)s.%(ext)s",
@@ -258,16 +276,16 @@ func videoFromCache(ctx context.Context, c *docker.Client, image, hostMount, url
 		"--continue",
 		"--no-write-info-json",
 		"--no-write-sub", "--no-write-auto-sub",
-		"--no-warnings",
 	}
 	if opts.Subtitles {
 		// Cached subtitle URLs expire; simplest reliable path is one
 		// small subs-only fetch alongside the resumed video download.
 		cmd = append(cmd, "--write-sub", "--write-auto-sub", "--sub-lang", opts.SubLang, "--convert-subs", "srt")
 	}
+	cmd = youtubeArgs(cmd, providerURL)
 	cmd = append(cmd, url)
 
-	if err := c.Run(ctx, docker.RunOptions{Image: image, HostMountPath: hostMount, Cmd: cmd}); err != nil {
+	if err := c.Run(ctx, docker.RunOptions{Image: image, HostMountPath: hostMount, Network: docker.ToolNetworkName, Cmd: cmd}); err != nil {
 		return err
 	}
 	return muxIfNeeded(ctx, c, image, hostMount, meta, opts)

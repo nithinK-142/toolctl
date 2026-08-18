@@ -97,7 +97,7 @@ func runConfig(args []string) error {
 // dockerClient sets up a Docker SDK client, resolves config, and
 // ensures the toolbox image is present — the shared setup every tool
 // command needs before it can run a container.
-func dockerClient(ctx context.Context) (*docker.Client, *config.Config, error) {
+func dockerClient(ctx context.Context, needsPOTProvider bool) (*docker.Client, *config.Config, error) {
 	cfg, err := config.RequireMount()
 	if err != nil {
 		return nil, nil, err
@@ -110,6 +110,12 @@ func dockerClient(ctx context.Context) (*docker.Client, *config.Config, error) {
 		c.Close()
 		return nil, nil, err
 	}
+	if needsPOTProvider {
+		if err := c.EnsurePOTProvider(ctx, cfg.POTProviderImage); err != nil {
+			c.Close()
+			return nil, nil, err
+		}
+	}
 	return c, cfg, nil
 }
 
@@ -117,7 +123,7 @@ func runAudio(ctx context.Context, args []string) error {
 	if len(args) < 1 {
 		return fmt.Errorf("usage: toolctl audio <url>")
 	}
-	c, cfg, err := dockerClient(ctx)
+	c, cfg, err := dockerClient(ctx, true)
 	if err != nil {
 		return err
 	}
@@ -141,7 +147,7 @@ func runVideo(ctx context.Context, args []string) error {
 		return err
 	}
 
-	c, cfg, err := dockerClient(ctx)
+	c, cfg, err := dockerClient(ctx, true)
 	if err != nil {
 		return err
 	}
@@ -186,7 +192,7 @@ func runGallery(ctx context.Context, args []string) error {
 	if len(args) < 1 {
 		return fmt.Errorf("usage: toolctl gallery <url>")
 	}
-	c, cfg, err := dockerClient(ctx)
+	c, cfg, err := dockerClient(ctx, false)
 	if err != nil {
 		return err
 	}

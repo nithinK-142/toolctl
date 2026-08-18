@@ -46,7 +46,9 @@ When present, toolctl passes it explicitly to gallery-dl.
 
 ## Toolbox versions
 
-The image pins the application versions used by the project: yt-dlp 2026.07.04, gallery-dl 1.32.8, and Deno 2.9.4. Deno is required for current YouTube JavaScript challenge solving; yt-dlp documents Deno as the recommended runtime. FFmpeg and jq come from the Debian base image repositories.
+The image pins the application versions used by the project: yt-dlp 2026.07.04, gallery-dl 1.32.8, Deno 2.9.4, and the `bgutil-ytdlp-pot-provider` plugin 1.3.1. Deno is required for current YouTube JavaScript challenge solving; yt-dlp documents Deno as the recommended runtime. FFmpeg and jq come from the Debian base image repositories.
+
+YouTube media requests may require Proof-of-Origin (PO) tokens. For YouTube audio/video commands, toolctl automatically pulls and manages the pinned `brainicism/bgutil-ytdlp-pot-provider:1.3.1-deno` sidecar, keeps it on a private `toolctl-net` Docker network, and configures yt-dlp to use the `mweb` client with that provider. The provider is not published to a host port. yt-dlp currently recommends PO Token Provider plugins for this class of YouTube request.
 
 Current project references were checked against the current Moby client documentation and current upstream tool releases.
 
@@ -54,4 +56,5 @@ Current project references were checked against the current Moby client document
 
 - YouTube login/bot checks may still require cookies.
 - The Go build cannot be validated in an offline environment; dependency resolution is performed by Go on the user's machine.
-- The toolbox image should be rebuilt when its pinned tool versions are intentionally updated.
+- The toolbox image should be rebuilt when its pinned tool versions or bundled yt-dlp plugins are intentionally updated.
+- The first YouTube audio/video run also pulls the pinned PO-token provider image and creates a private Docker network/container automatically.
